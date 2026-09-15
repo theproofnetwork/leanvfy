@@ -1,0 +1,10 @@
+name = "solution"
+defaultTargets = ["Solution"]
+
+[[require]]
+name = "challenge"
+git = "https://github.com/theproofnetwork/leanvfy"
+rev = "314416102f2b7849ed1c2a0926492340e5df3575"
+
+[[lean_lib]]
+name = "Solution"

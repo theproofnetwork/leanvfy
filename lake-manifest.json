@@ -1,0 +1,21 @@
+{
+  "version": "1.2.0",
+  "packagesDir": ".lake/packages",
+  "packages": [
+    {
+      "url": "https://github.com/theproofnetwork/leanvfy",
+      "type": "git",
+      "subDir": null,
+      "scope": "",
+      "rev": "314416102f2b7849ed1c2a0926492340e5df3575",
+      "name": "challenge",
+      "manifestFile": "lake-manifest.json",
+      "inputRev": "314416102f2b7849ed1c2a0926492340e5df3575",
+      "inherited": false,
+      "configFile": "lakefile.toml"
+    }
+  ],
+  "name": "solution",
+  "lakeDir": ".lake",
+  "fixedToolchain": false
+}
