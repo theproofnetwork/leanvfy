@@ -75,7 +75,10 @@ _test_cleanup() {
         sudo rm -f "$ca_file"
         sudo update-ca-certificates --fresh >/dev/null
     fi
-    [ -n "$work" ] && rm -rf "$work"
+    # provision-toolchain.sh leaves root-owned, read-only trees behind.
+    if [ -n "$work" ]; then
+        rm -rf "$work" 2>/dev/null || sudo rm -rf "$work" || true
+    fi
 }
 test_init() {
     work="$(mktemp -d)"
