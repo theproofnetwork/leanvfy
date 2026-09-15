@@ -92,11 +92,10 @@ jobs:
       # HEAD of this checkout is the commit that ran leanvfy.yml above
       # (job_workflow_sha in the certificate), i.e. verify.sh's default
       # trusted revision; --workflow-repo names this repository in case it is
-      # a fork. Depth 2 so that HEAD~1 is available as an untrusted revision.
+      # a fork.
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-          fetch-depth: 2
 
       # `--challenge` as an https URL: the clone holds every branch, so the
       # fixture commit is present. The attestation can take a moment to become
@@ -174,10 +173,12 @@ jobs:
       - name: A workflow revision the verifier does not trust is rejected
         run: |
           set -euo pipefail
-          # HEAD~1 is a revision of this repository that did not sign the
-          # attestation (on the initial commit: an id that is not in the
-          # clone, which is rejected before any lookup).
-          other="$(git rev-parse --verify -q 'HEAD~1^{commit}' 2>/dev/null || printf 'c%.0s' $(seq 40))"
+          # A revision of this repository that has a lockfile but predates
+          # e2e.yml, so no attestation of the fixtures can ever have been
+          # signed by it. (Not HEAD~1: the previous push's run signed one, and
+          # a verifier trusting that revision rightly gets it accepted.)
+          other=4ce347ee3e4718c43fab839d0cde1a0d6bf91fc3
+          git fetch -q --depth 1 origin "$other"
           if ./verify.sh --theorem "$THEOREM" \
               --challenge "https://github.com/$REPO" --challenge-commit "$CHALLENGE_COMMIT" \
               --challenge-module "$CHALLENGE_MODULE" --prover "$REPO" --workflow-repo "$REPO" \
@@ -185,7 +186,7 @@ jobs:
             echo "accepted an attestation signed by an untrusted workflow revision" >&2; exit 1
           fi
           cat /tmp/err >&2
-          grep -q 'not a trusted revision\|not in this clone' /tmp/err
+          grep -q 'not a trusted revision' /tmp/err
 
       - name: An axiom policy the verifier does not accept is rejected
         run: |
