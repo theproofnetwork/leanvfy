@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Behavioural tests for the untrusted-input scripts: fetch-repo.sh,
-# materialize-deps.sh and tree-digest.sh. Linux only (bubblewrap); run by
+# materialize-deps.sh and tree-digest.sh (plus verify.sh's re-implementation of
+# the digest). Linux only (bubblewrap); run by
 # .github/workflows/test-scripts.yml and usable locally with sudo (it installs a
 # throwaway CA into the system trust store for the duration of the run).
 #
@@ -133,6 +134,18 @@ printf '[submodule "vendored"]\n\tpath = vendored\n\turl = %s/dep.git\n' "$base"
 git -C "$d" add -A >/dev/null
 git -C "$d" update-index --add --cacheinfo "160000,$dep_commit,vendored"
 submodule_commit="$(publish submodule "$d" noadd)"
+
+# Two trees a newline-terminated digest listing could not tell apart: files a
+# and b, versus a single file named "a<newline><mode> <sha256 of b> b" holding
+# a's content (git allows newlines in names). The digest records are NUL-
+# terminated precisely so that these differ.
+d="$(new_repo two_files)"
+echo alpha >"$d/a"
+echo beta >"$d/b"
+two_files_commit="$(publish two_files "$d")"
+d="$(new_repo forged_name)"
+echo alpha >"$d/$(printf 'a\n100644 %s b' "$(sha256sum <"$work/src/two_files/b" | cut -d' ' -f1)")"
+forged_name_commit="$(publish forged_name "$d")"
 
 # --- local https server ------------------------------------------------------
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=leanvfy-test \
@@ -286,6 +299,17 @@ d2="$(bash "$digest" "$ref" "$good_commit")"
 d3="$(bash "$digest" "$work/src/dep" "$dep_commit")"
 [ "$d3" != "$d1" ] && ok "different trees give different digests" || bad "digest collision between fixtures"
 expect_reject "digest refuses submodule trees" bash "$digest" "$work/src/submodule" "$submodule_commit"
+d5="$(bash "$digest" "$work/src/two_files" "$two_files_commit")"
+d6="$(bash "$digest" "$work/src/forged_name" "$forged_name_commit")"
+[ "$d5" != "$d6" ] && [[ "$d6" =~ ^[a-f0-9]{64}$ ]] && ok "a newline in a path cannot forge listing records" || bad "digest collision via newline in path: $d5 vs $d6"
+# verify.sh recomputes the subject on the verifier's machine, without the jail;
+# it must agree with the reference implementation byte for byte.
+verify="$here/../verify.sh"
+d4="$(bash "$verify" --challenge "$ref" --challenge-commit "$good_commit" --digest-only)"
+[ "$d4" = "$d1" ] && ok "verify.sh recomputes the same digest" || bad "verify.sh digest differs: $d4 vs $d1"
+d7="$(bash "$verify" --challenge "$work/src/forged_name" --challenge-commit "$forged_name_commit" --digest-only)"
+[ "$d7" = "$d6" ] && ok "verify.sh agrees on a tree with a newline in a path" || bad "verify.sh digest differs on newline path: $d7 vs $d6"
+expect_reject "verify.sh refuses submodule trees" bash "$verify" --challenge "$work/src/submodule" --challenge-commit "$submodule_commit" --digest-only
 
 if [ -n "${GITHUB_REPOSITORY:-}" ] && [ -n "${GITHUB_SHA:-}" ]; then
     echo "Smart HTTP against GitHub"

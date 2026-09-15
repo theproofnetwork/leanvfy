@@ -147,7 +147,8 @@ The attestation says that `theorem`, as declared in `challenge.annotations.modul
 module and everything it imports from the repository, `lakefile.toml`, and the dependency revisions
 pinned in `lake-manifest.json` (the statement's meaning depends on the definitions it pulls from
 them). Check all three of commit, module and theorem name against the predicate; the same theorem
-name can legitimately exist in several modules of one repository.
+name can legitimately exist in several modules of one repository. [verify.sh](verify.sh) performs
+these comparisons, together with the certificate checks below, given the audited commit.
 
 ### Attestation contents
 
@@ -164,11 +165,13 @@ via `actions/attest`. What a verifier learns is split over two layers:
 | Challenge and solution commit ids, repository URLs and modules | Predicate `challenge` / `solution` (`digest.gitCommit`, `uri`, `annotations.module`) | The commit id is what a verifier compares against the challenge they audited; the URL is only a locator |
 | Theorem name, result, axiom policy, pinned toolchain (incl. tool patches) | Predicate ([schemas/leanvfy-v1.json](schemas/leanvfy-v1.json)) | Computed by the trusted workflow code; not expressible in the certificate |
 
-The tree digest ([scripts/tree-digest.sh](scripts/tree-digest.sh)) is the sha256 over the lines
-`<mode> <sha256 of blob content> <path>` for every blob of `git ls-tree -r <commit>`, in git's order.
-Git commit ids are SHA-1 in almost every repository and `actions/attest` indexes subjects by sha256;
-the digest binds every path, mode and byte of the checked-out tree independently of SHA-1 and is
-reproducible on any clone of the commit.
+The tree digest ([scripts/tree-digest.sh](scripts/tree-digest.sh)) is the sha256 over the
+NUL-terminated records `<mode> <sha256 of blob content> <path>` for every blob of
+`git ls-tree -r <commit>`, in git's order. Git commit ids are SHA-1 in almost every repository and
+`actions/attest` indexes subjects by sha256; the digest binds every path, mode and byte of the
+checked-out tree independently of SHA-1 and is reproducible on any clone of the commit. Records are
+NUL- rather than newline-terminated because NUL is the one byte a git tree name cannot contain, which
+is what makes the listing an unambiguous encoding of the tree.
 
 The predicate therefore contains **no** workflow identity, runner type, repository or timestamp fields.
 A verifier MUST take those from the certificate and MUST NOT accept a predicate-supplied value in their place.
@@ -267,8 +270,40 @@ theorem's own module separate from those, since the solution cannot import a mod
 declares the theorem), or restate the definitions. Neither tree may contain `.lake`
 or Lake build outputs. Everything, dependencies included, is compiled from source with the Lean release
 in [toolchain.lock](toolchain.lock) inside a network-less jail, so keep imports targeted.
+### Verifying an attestation
+
+[verify.sh](verify.sh) does the verifier's side. It needs `git`, `jq` and an authenticated
+[GitHub CLI](https://cli.github.com) and runs on Linux or macOS:
+
+```sh
+git clone https://github.com/theproofnetwork/leanvfy && cd leanvfy    # review; HEAD becomes the trusted revision
+./verify.sh --theorem MyChallenge.main             --challenge ~/src/my-challenge --challenge-commit <full commit id> --challenge-module MyChallenge             --prover prover/my-solution
+```
+
+`--challenge` is the verifier's own clone of the challenge they audited (or an https URL to clone);
+`--prover` the repository (or owner) the prover ran the workflow in, where the attestation is fetched
+from -- or pass a bundle downloaded from the run's attestation page with `--bundle` to verify offline.
+The script:
+
+1. lists the audited tree exactly as [scripts/tree-digest.sh](scripts/tree-digest.sh) did on the
+   runner and hands that listing to `gh attestation verify`, which looks the attestation up by its
+   sha256 and checks the Sigstore signature, transparency log, OIDC issuer, that the signing workflow
+   is `leanvfy.yml` of this repository, that the runner was GitHub-hosted and the predicate type;
+2. checks what `gh` cannot know: the certificate's `job_workflow_sha` must be a trusted revision of
+   this repository (by default the commit the script runs from; more with `--workflow-commit`), the
+   predicate must bind the audited digest to the *challenge* role and name the audited commit, module
+   and theorem, say `PASSED`, and repeat the `toolchain` block and the axiom policy exactly as
+   `toolchain.lock` and `leanvfy.yml` at that revision define them; the policy must also be within
+   what the verifier accepts (`--allowed-axioms`, default `propext,Quot.sound,Classical.choice`);
+3. prints the claim: the solution's repository, commit and module, the axiom policy, the prover's
+   run, the signing time and the toolchain (`--json` for the verified statement and certificate).
+
+Every accepted attestation goes through all of this; a rejection lists which claim differed. What
+the script cannot do is the audit itself: that the challenge module at that commit formalizes the
+intended statement is the verifier's judgement (see "What a verifier must audit in a challenge").
+The solution is never needed on the verifier's machine.
+
 <!-- TODO Document security considerations and mitigations -->
-<!-- TODO verifier script -->
 <!-- TODO resolve todos in workflow -->
 <!-- TODO upstream on lean/comparator: request the option to provide exports directly -->
 

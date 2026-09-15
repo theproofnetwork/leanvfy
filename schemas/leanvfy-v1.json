@@ -139,7 +139,7 @@
         },
         "GitCheckout": {
             "allOf": [{ "$ref": "in-toto-v1.json#/$defs/ResourceDescriptor" }],
-            "description": "A git repository at one commit. `uri` is where the workflow fetched it from and is only a locator: any repository serving the same commit yields the same tree. `digest.gitCommit` is the commit id (SHA-1 or SHA-256 repository format) and the identity a verifier compares against their own clone. `digest.sha256` is the tree digest computed by scripts/tree-digest.sh of the workflow repository: the sha256 over the lines `<mode> <sha256 of blob content> <path>` (one per blob of `git ls-tree -r <commit>`, in git's order, newline-terminated). It binds every path, mode and byte of the tree independently of SHA-1 and is the subject under which the attestation is published.",
+            "description": "A git repository at one commit. `uri` is where the workflow fetched it from and is only a locator: any repository serving the same commit yields the same tree. `digest.gitCommit` is the commit id (SHA-1 or SHA-256 repository format) and the identity a verifier compares against their own clone. `digest.sha256` is the tree digest computed by scripts/tree-digest.sh of the workflow repository: the sha256 over the records `<mode> <sha256 of blob content> <path>` (one per blob of `git ls-tree -r <commit>`, in git's order, each terminated by a NUL byte, the one byte a tree name cannot contain). It binds every path, mode and byte of the tree independently of SHA-1 and is the subject under which the attestation is published.",
             "required": ["name", "uri", "digest", "annotations"],
             "properties": {
                 "digest": {
