@@ -5,7 +5,8 @@
 #
 # Usage:
 #   verify.sh --theorem <name> --challenge <dir|https-url> --challenge-commit <id>
-#             --prover <owner>[/<repo>] [--bundle <file>] [options]
+#             --prover <owner>[/<repo>] [--bundle <file> [--trusted-root <file>]]
+#             [options]
 #
 #   --theorem NAME             Fully-qualified name of the theorem, as declared
 #                              in the challenge module
@@ -18,9 +19,21 @@
 #   --prover OWNER[/REPO]      Repository (or owner) the prover ran the
 #                              workflow in. Attestations are looked up there
 #                              via the GitHub API unless --bundle is given
-#   --bundle FILE              Sigstore bundle (as written by
-#                              `gh attestation download`) to verify instead of
-#                              fetching from GitHub
+#   --bundle FILE              Sigstore bundle to verify instead of fetching
+#                              from GitHub: one bundle as a JSON file (the
+#                              `bundle` of --json, or `gh attestation
+#                              download`'s output) or several as JSON lines.
+#                              Untrusted input: it is what the prover hands
+#                              over, and every claim in it is checked the
+#                              same way; --prover is then checked against
+#                              the certificate's source repository by gh
+#   --trusted-root FILE        Sigstore trusted root (`gh attestation
+#                              trusted-root > FILE` on a networked machine)
+#                              for verifying a bundle without network access.
+#                              As security-relevant as this checkout: it holds
+#                              the keys signatures are checked against, so
+#                              obtain it from a machine and account you trust
+#                              and refresh it as Sigstore rotates keys
 #   --workflow-commit ID       Revision of this repository trusted to have
 #                              produced the attestation; repeatable. Default:
 #                              HEAD of the checkout this script runs from
@@ -31,12 +44,15 @@
 #                              propext,Quot.sound,Classical.choice)
 #   --digest-only              Print the challenge tree digest and stop; no
 #                              attestation is looked at
-#   --json                     Print the verified statement and certificate
-#                              summary as JSON instead of the report
+#   --json                     Print the verified statement, certificate
+#                              summary, timestamps and the verified bundle as
+#                              JSON instead of the report (`.bundle` can be
+#                              archived and re-verified with --bundle)
 #
 # Needs git, jq and the GitHub CLI (`gh`, authenticated: `gh auth login` or
-# GH_TOKEN; verification fetches Sigstore trust roots and, without --bundle,
-# the attestations through the API). Runs on Linux and macOS.
+# GH_TOKEN; verification fetches the Sigstore trust root unless --trusted-root
+# is given and, without --bundle, the attestations through the API). Runs on
+# Linux and macOS.
 #
 # What is checked, and against what (README "Attestation contents"):
 #   1. The attestation subject. The verifier's own clone of the challenge is
@@ -57,7 +73,8 @@
 #      (--allowed-axioms).
 # The predicate's solution block is reported, not judged: the solution is
 # whatever the workflow at that commit accepted. Nothing about the prover's
-# repository is trusted; --prover only tells gh where to look.
+# repository is trusted: --prover tells gh where to look and is checked
+# against the certificate's source repository, never the other way round.
 set -euo pipefail
 
 WORKFLOW_PATH=.github/workflows/leanvfy.yml
@@ -78,13 +95,13 @@ fail() {
 }
 
 theorem="" challenge="" challenge_commit="" challenge_module=Challenge
-prover="" bundle="" workflow_repo=theproofnetwork/leanvfy
+prover="" bundle="" trusted_root="" workflow_repo=theproofnetwork/leanvfy
 allowed_axioms=propext,Quot.sound,Classical.choice
 digest_only=0 json_out=0
 trusted=()
 while [ $# -gt 0 ]; do
     case "$1" in
-        --theorem | --challenge | --challenge-commit | --challenge-module | --prover | --bundle | --workflow-commit | --workflow-repo | --allowed-axioms)
+        --theorem | --challenge | --challenge-commit | --challenge-module | --prover | --bundle | --trusted-root | --workflow-commit | --workflow-repo | --allowed-axioms)
             [ $# -ge 2 ] || fail "$1 needs a value"
             ;;
     esac
@@ -95,6 +112,7 @@ while [ $# -gt 0 ]; do
         --challenge-module) challenge_module="$2" ;;
         --prover) prover="$2" ;;
         --bundle) bundle="$2" ;;
+        --trusted-root) trusted_root="$2" ;;
         --workflow-commit) trusted+=("$2") ;;
         --workflow-repo) workflow_repo="$2" ;;
         --allowed-axioms) allowed_axioms="$2" ;;
@@ -118,6 +136,8 @@ if [ "$digest_only" -eq 0 ]; then
     [[ "$prover" =~ ^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)?$ ]] || fail "--prover must be <owner> or <owner>/<repo>"
     [[ "$workflow_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "--workflow-repo must be <owner>/<repo>"
     [ -z "$bundle" ] || [ -f "$bundle" ] || fail "bundle '$bundle' does not exist"
+    [ -z "$trusted_root" ] || [ -f "$trusted_root" ] || fail "trusted root '$trusted_root' does not exist"
+    [ -z "$trusted_root" ] || [ -n "$bundle" ] || fail "--trusted-root is for verifying a bundle; pass --bundle"
 fi
 
 for tool in git jq; do
@@ -211,6 +231,7 @@ scope=(--repo "$prover")
 [[ "$prover" == */* ]] || scope=(--owner "$prover")
 source=()
 [ -z "$bundle" ] || source=(--bundle "$bundle")
+[ -z "$trusted_root" ] || source+=(--custom-trusted-root "$trusted_root")
 if ! gh attestation verify "$subject" "${scope[@]}" ${source[@]+"${source[@]}"} \
     --cert-oidc-issuer "$OIDC_ISSUER" \
     --signer-workflow "$workflow_repo/$WORKFLOW_PATH" \
@@ -284,7 +305,9 @@ done
 [ -n "$accepted" ] || fail "no attestation for the audited challenge tree makes the expected claim"
 
 if [ "$json_out" -eq 1 ]; then
-    jq --argjson i "$accepted" '.[$i].verificationResult | {statement, certificate: .signature.certificate, verifiedTimestamps}' "$work/results.json"
+    # The bundle is the verified attestation itself, for archiving; --bundle
+    # takes it back.
+    jq --argjson i "$accepted" '.[$i] | (.verificationResult | {statement, certificate: .signature.certificate, verifiedTimestamps}) + {bundle: .attestation.bundle}' "$work/results.json"
     exit 0
 fi
 
@@ -302,6 +325,7 @@ jq -r --argjson i "$accepted" '
   "  workflow         \($cert.subjectAlternativeName)",
   "                   commit \($cert.buildSignerDigest)",
   "  runner           \($cert.runnerEnvironment)",
+  "  prover           \($cert.sourceRepositoryURI) (checked against --prover)",
   "  prover run       \($cert.runInvocationURI) (\($cert.buildTrigger) on \($cert.sourceRepositoryRef))",
   "  signed           \([.verifiedTimestamps[]? | "\(.timestamp) (\(.type))"] | join(", "))",
   "  lean             \($pred.toolchain.lean.annotations.version)",

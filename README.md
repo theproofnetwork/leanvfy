@@ -288,8 +288,7 @@ git clone https://github.com/theproofnetwork/leanvfy && cd leanvfy    # review; 
 
 `--challenge` is the verifier's own clone of the challenge they audited (or an https URL to clone);
 `--prover` the repository (or owner) the prover ran the workflow in, where the attestation is fetched
-from -- or pass a bundle downloaded from the run's attestation page with `--bundle` to verify offline.
-The script:
+from. The script:
 
 1. lists the audited tree exactly as [scripts/tree-digest.sh](scripts/tree-digest.sh) did on the
    runner and hands that listing to `gh attestation verify`, which looks the attestation up by its
@@ -302,12 +301,32 @@ The script:
    `toolchain.lock` and `leanvfy.yml` at that revision define them; the policy must also be within
    what the verifier accepts (`--allowed-axioms`, default `propext,Quot.sound,Classical.choice`);
 3. prints the claim: the solution's repository, commit and module, the axiom policy, the prover's
-   run, the signing time and the toolchain (`--json` for the verified statement and certificate).
+   repository and run, the signing time and the toolchain (`--json` for the verified statement,
+   certificate and the bundle itself).
 
 Every accepted attestation goes through all of this; a rejection lists which claim differed. What
 the script cannot do is the audit itself: that the challenge module at that commit formalizes the
 intended statement is the verifier's judgement (see "What a verifier must audit in a challenge").
 The solution is never needed on the verifier's machine.
+
+#### Bundles handed over by the prover
+
+The attestation can also travel as a file: the `bundle` of `--json`, or what `gh attestation
+download` writes (one bundle per line). `--bundle FILE` verifies that instead of fetching from
+GitHub. A bundle is untrusted input -- it is whatever the prover chose to hand over -- and nothing
+changes about what is checked: the signature and certificate are verified by `gh` against the
+Sigstore trust root, `--prover` is checked against the certificate's source repository rather than
+trusted, and the claim checks above run unchanged; a bundle whose statement was altered by one byte,
+or one produced in another repository, is rejected like any other. A file holding several bundles
+is fine: `gh` drops the ones whose signature does not verify and the script judges the rest.
+
+Even with a bundle, `gh` fetches the Sigstore trust root (the keys signatures are checked against)
+over the network unless it is given one. For verification without network access, obtain it on a
+machine and with an account you trust -- `gh attestation trusted-root > root.jsonl` -- and pass
+`--trusted-root root.jsonl`. That file is then as security-relevant as the checkout of this
+repository the script runs from: a stale or substituted root would accept signatures under keys
+Sigstore has rotated or never issued, so refresh it as you would update the checkout.
+[e2e.yml](.github/workflows/e2e.yml) exercises all of this on every push, on a genuine bundle.
 
 
 ## Development

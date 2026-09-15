@@ -6,7 +6,9 @@ name: End-to-End Attestation
 # the challenge at its commit, imports its definitions, proves the theorem in
 # module `Solution`). The run produces a genuine attestation; a third job then
 # runs verify.sh against it the way a verifier would -- clone of the challenge,
-# `gh attestation verify`, every claim check -- and confirms that the claims
+# `gh attestation verify`, every claim check -- then again from the bundle
+# as a file (with and without a separately obtained trusted root, a tampered
+# copy, a wrong --prover, a multi-bundle file), and confirms that the claims
 # a dishonest prover would need to alter are rejected against the same
 # attestation. Rejections of dishonest *solutions* need no attestation and
 # are covered by scripts/test-pipeline.sh in test-scripts.yml.
@@ -130,6 +132,65 @@ jobs:
             --challenge "https://github.com/$REPO" --challenge-commit "$CHALLENGE_COMMIT" \
             --challenge-module "$CHALLENGE_MODULE" \
             --prover "$REPO" --workflow-repo "$REPO" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # The bundle path: what a verifier does when the prover hands over the
+      # attestation as a file instead of pointing at a repository. The bundle
+      # `--json` printed above is the verified attestation; it must verify
+      # again from disk, also with a trusted root obtained separately (which
+      # is what makes verification possible without network access: gh then
+      # fetches nothing from Sigstore).
+      - name: The verified bundle re-verifies from a file
+        run: |
+          set -euo pipefail
+          jq .bundle /tmp/verified.json > /tmp/bundle.json
+          ./verify.sh --theorem "$THEOREM" \
+            --challenge "https://github.com/$REPO" --challenge-commit "$CHALLENGE_COMMIT" \
+            --challenge-module "$CHALLENGE_MODULE" --prover "$REPO" --workflow-repo "$REPO" \
+            --bundle /tmp/bundle.json >/dev/null
+          gh attestation trusted-root > /tmp/root.jsonl
+          ./verify.sh --theorem "$THEOREM" \
+            --challenge "https://github.com/$REPO" --challenge-commit "$CHALLENGE_COMMIT" \
+            --challenge-module "$CHALLENGE_MODULE" --prover "$REPO" --workflow-repo "$REPO" \
+            --bundle /tmp/bundle.json --trusted-root /tmp/root.jsonl --json > /tmp/verified-offline.json
+          jq -e --arg sha "$GITHUB_SHA" '.certificate.buildSignerDigest == $sha' /tmp/verified-offline.json >/dev/null
+          echo "bundle re-verified, with and without a custom trusted root"
+
+      # A bundle is untrusted bytes. One altered byte in the signed statement
+      # (PASSED -> FAILED, re-encoded) must fail the signature check, and a
+      # genuine bundle must not verify for a prover repository other than the
+      # one in its certificate: --prover is checked, not trusted.
+      - name: A tampered bundle and a wrong --prover are rejected
+        run: |
+          set -euo pipefail
+          jq '.dsseEnvelope.payload |= (@base64d | sub("PASSED"; "FAILED") | @base64)' /tmp/bundle.json > /tmp/tampered.json
+          if ./verify.sh --theorem "$THEOREM" \
+              --challenge "https://github.com/$REPO" --challenge-commit "$CHALLENGE_COMMIT" \
+              --challenge-module "$CHALLENGE_MODULE" --prover "$REPO" --workflow-repo "$REPO" \
+              --bundle /tmp/tampered.json 2>/tmp/err; then
+            echo "accepted a bundle whose statement was altered" >&2; exit 1
+          fi
+          cat /tmp/err >&2
+          grep -q 'no valid attestation' /tmp/err
+          if ./verify.sh --theorem "$THEOREM" \
+              --challenge "https://github.com/$REPO" --challenge-commit "$CHALLENGE_COMMIT" \
+              --challenge-module "$CHALLENGE_MODULE" --prover other-owner/other-repo --workflow-repo "$REPO" \
+              --bundle /tmp/bundle.json 2>/tmp/err; then
+            echo "accepted a bundle for a prover repository other than the certificate's" >&2; exit 1
+          fi
+          cat /tmp/err >&2
+          grep -q 'no valid attestation' /tmp/err
+
+      # A JSON-lines file may hold several bundles (gh attestation download
+      # writes one); gh drops the ones that fail signature verification and
+      # verify.sh judges the rest.
+      - name: A multi-bundle file with a bad entry first is accepted on the good one
+        run: |
+          set -euo pipefail
+          { jq -c . /tmp/tampered.json; jq -c . /tmp/bundle.json; } > /tmp/bundles.jsonl
+          ./verify.sh --theorem "$THEOREM" \
+            --challenge "https://github.com/$REPO" --challenge-commit "$CHALLENGE_COMMIT" \
+            --challenge-module "$CHALLENGE_MODULE" --prover "$REPO" --workflow-repo "$REPO" \
+            --bundle /tmp/bundles.jsonl --json | jq -e --arg sha "$GITHUB_SHA" '.certificate.buildSignerDigest == $sha' >/dev/null
 
       # The same attestation must not verify a different claim. Each case
       # changes one thing a dishonest prover would need the verifier to

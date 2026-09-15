@@ -29,14 +29,16 @@ command -v check-jsonschema >/dev/null || {
 # tree); verify.sh itself is the working-tree copy.
 wf="$work/leanvfy"
 git clone -q "$root" "$wf"
-cp "$root/verify.sh" "$wf/verify.sh"
-verify="$wf/verify.sh"
 wf_commit="$(git -C "$wf" rev-parse --verify 'HEAD^{commit}')"
 git -C "$wf" checkout -q -b other
 jq '.lean.version = "v9.9.9"' "$wf/toolchain.lock" >"$wf/toolchain.lock.new" && mv "$wf/toolchain.lock.new" "$wf/toolchain.lock"
-git -C "$wf" commit -q -am "other revision"
+git -C "$wf" add toolchain.lock
+git -C "$wf" commit -q -m "other revision"
 other_commit="$(git -C "$wf" rev-parse HEAD)"
 git -C "$wf" checkout -q --detach "$wf_commit"
+# After the checkout, so that the copy is never committed or reverted.
+cp "$root/verify.sh" "$wf/verify.sh"
+verify="$wf/verify.sh"
 wf_repo=theproofnetwork/leanvfy
 wf_path=.github/workflows/leanvfy.yml
 
@@ -109,6 +111,7 @@ result() {
     jq -n --arg commit "$commit" --arg digest "$d" --arg wf_commit "$wf_commit" \
         --arg san "https://github.com/$wf_repo/$wf_path@refs/heads/main" \
         --slurpfile pred "$work/predicate.json" '[{
+          attestation: { bundle: { mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json", verificationMaterial: {}, dsseEnvelope: {} }, bundle_url: "" },
           verificationResult: {
             signature: { certificate: {
               issuer: "https://token.actions.githubusercontent.com",
@@ -155,6 +158,7 @@ result '.'
 expect_accept "accepted" run
 grep -q '^VERIFIED: T.main, as stated in module Challenge of challenge commit' "$work/last.log" && ok "report names theorem, module and commit" || bad "report differs"
 grep -q 'prover/repo/actions/runs/1' "$work/last.log" && ok "report shows the prover's run" || bad "run URL missing from report"
+grep -q '^  prover           https://github.com/prover/repo (checked against --prover)' "$work/last.log" && ok "report names the verified source repository" || bad "source repository missing from report"
 [ "$(cat "$GH_SUBJECT_OUT")" = "$d" ] && ok "gh was handed the tree listing whose sha256 is the digest" || bad "subject file hash $(cat "$GH_SUBJECT_OUT") differs from $d"
 args="$(tr '\n' ' ' <"$GH_ARGS_OUT")"
 [[ "$args" == "attestation verify "* ]] && ok "gh attestation verify" || bad "gh called as: $args"
@@ -167,9 +171,18 @@ done
 expect_accept "--json" run --json
 jq -e '.statement.predicate.theorem == "T.main" and .certificate.runnerEnvironment == "github-hosted" and (.verifiedTimestamps | length) == 1' "$work/last.log" >/dev/null \
     && ok "--json prints statement, certificate and timestamps" || bad "--json output differs"
+jq -e '.bundle.mediaType == "application/vnd.dev.sigstore.bundle.v0.3+json"' "$work/last.log" >/dev/null \
+    && ok "--json includes the verified bundle" || bad "--json lacks the bundle"
 expect_accept "--prover owner and --bundle" run --prover prover --bundle "$GH_RESULT"
 args="$(tr '\n' ' ' <"$GH_ARGS_OUT")"
 [[ " $args " == *" --owner prover "* ]] && [[ " $args " == *" --bundle $GH_RESULT "* ]] && ok "gh given --owner and --bundle" || bad "args: $args"
+[[ "$args" != *"--custom-trusted-root"* ]] && ok "no --custom-trusted-root unless asked" || bad "trusted root passed unasked"
+echo '{}' >"$work/root.jsonl"
+expect_accept "--bundle with --trusted-root" run --bundle "$GH_RESULT" --trusted-root "$work/root.jsonl"
+args="$(tr '\n' ' ' <"$GH_ARGS_OUT")"
+[[ " $args " == *" --custom-trusted-root $work/root.jsonl "* ]] && ok "gh given --custom-trusted-root" || bad "args: $args"
+expect_reject "--trusted-root without --bundle" run --trusted-root "$work/root.jsonl"
+expect_reject "--trusted-root that does not exist" run --bundle "$GH_RESULT" --trusted-root "$work/absent"
 expect_accept "--workflow-commit naming HEAD explicitly" run --workflow-commit "$wf_commit"
 expect_accept "--workflow-commit HEAD plus another trusted revision" run --workflow-commit "$other_commit" --workflow-commit "$wf_commit"
 expect_accept "--allowed-axioms superset" run --allowed-axioms "$axioms,Extra.ax"
