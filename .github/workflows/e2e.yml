@@ -1,0 +1,200 @@
+name: End-to-End Attestation
+
+# The reusable workflow, called as a prover calls it, on the fixture packages
+# kept in this repository's orphan branches `fixtures/challenge` (states
+# `Challenge.main` in module `Challenge`) and `fixtures/solution` (requires
+# the challenge at its commit, imports its definitions, proves the theorem in
+# module `Solution`). The run produces a genuine attestation; a third job then
+# runs verify.sh against it the way a verifier would -- clone of the challenge,
+# `gh attestation verify`, every claim check -- and confirms that the claims
+# a dishonest prover would need to alter are rejected against the same
+# attestation. Rejections of dishonest *solutions* need no attestation and
+# are covered by scripts/test-pipeline.sh in test-scripts.yml.
+#
+# The fixture branches are pinned by commit id only through the solution's
+# lake-manifest.json; the workflow inputs resolve the branch heads at run time,
+# so updating a fixture means updating the branch (and, for the challenge, the
+# solution's manifest).
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  THEOREM: Challenge.main
+  CHALLENGE_MODULE: Challenge
+  SOLUTION_MODULE: Solution
+
+jobs:
+  fixtures:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      challenge_commit: ${{ steps.resolve.outputs.challenge_commit }}
+      solution_commit: ${{ steps.resolve.outputs.solution_commit }}
+    steps:
+      - name: Resolve fixture commits
+        id: resolve
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for b in challenge solution; do
+            c="$(git ls-remote "https://github.com/$REPO" "refs/heads/fixtures/$b" | cut -f1)"
+            if ! [[ "$c" =~ ^[a-f0-9]{40}$ ]]; then
+              echo "branch fixtures/$b not found in $REPO" >&2
+              exit 1
+            fi
+            echo "fixtures/$b is at $c"
+            echo "${b}_commit=$c" >> "$GITHUB_OUTPUT"
+          done
+
+  attest:
+    needs: fixtures
+    # Pull requests from forks get no OIDC token, so the attest job of the
+    # called workflow could not sign; skip rather than fail.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # The workspace-relative form: zizmor prefers GitHub's newer `$/` form
+    # (not subject to files cloned at run time), which actionlint 1.7.12 does
+    # not parse yet. Nothing here clones anything before the call anyway.
+    uses: ./.github/workflows/leanvfy.yml # zizmor: ignore[self-repository]
+    # Exactly the permissions the README tells a prover to grant.
+    permissions:
+      id-token: write
+      contents: read
+      attestations: write
+      artifact-metadata: write
+    with:
+      theorem: Challenge.main
+      challenge_repo: https://github.com/${{ github.repository }}
+      challenge_commit: ${{ needs.fixtures.outputs.challenge_commit }}
+      challenge_module: Challenge
+      solution_repo: https://github.com/${{ github.repository }}
+      solution_commit: ${{ needs.fixtures.outputs.solution_commit }}
+      solution_module: Solution
+
+  verify:
+    needs: [fixtures, attest]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      CHALLENGE_COMMIT: ${{ needs.fixtures.outputs.challenge_commit }}
+      SOLUTION_COMMIT: ${{ needs.fixtures.outputs.solution_commit }}
+    steps:
+      # HEAD of this checkout is the commit that ran leanvfy.yml above
+      # (job_workflow_sha in the certificate), i.e. verify.sh's default
+      # trusted revision; --workflow-repo names this repository in case it is
+      # a fork. Depth 2 so that HEAD~1 is available as an untrusted revision.
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      # `--challenge` as an https URL: the clone holds every branch, so the
+      # fixture commit is present. The attestation can take a moment to become
+      # retrievable through the API after signing; retry for up to two minutes.
+      - name: Verify the attestation as a verifier would
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 8); do
+            if ./verify.sh --theorem "$THEOREM" \
+                --challenge "https://github.com/$REPO" --challenge-commit "$CHALLENGE_COMMIT" \
+                --challenge-module "$CHALLENGE_MODULE" \
+                --prover "$REPO" --workflow-repo "$REPO" --workflow-commit "$GITHUB_SHA" \
+                --json > /tmp/verified.json; then
+              break
+            fi
+            [ "$attempt" -lt 8 ] || { echo "no verifiable attestation after $attempt attempts" >&2; exit 1; }
+            echo "attempt $attempt: not verifiable yet, retrying" >&2
+            sleep 15
+          done
+          jq . /tmp/verified.json
+          jq -e --arg c "$SOLUTION_COMMIT" --arg m "$SOLUTION_MODULE" --arg sha "$GITHUB_SHA" '
+            .statement.predicate.solution.digest.gitCommit == $c
+            and .statement.predicate.solution.annotations.module == $m
+            and .certificate.buildSignerDigest == $sha
+            and .certificate.runnerEnvironment == "github-hosted"' /tmp/verified.json >/dev/null
+          echo "verified: solution $SOLUTION_COMMIT, signed by workflow commit $GITHUB_SHA"
+
+      - name: Report
+        run: |
+          set -euo pipefail
+          ./verify.sh --theorem "$THEOREM" \
+            --challenge "https://github.com/$REPO" --challenge-commit "$CHALLENGE_COMMIT" \
+            --challenge-module "$CHALLENGE_MODULE" \
+            --prover "$REPO" --workflow-repo "$REPO" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # The same attestation must not verify a different claim. Each case
+      # changes one thing a dishonest prover would need the verifier to
+      # overlook, and the rejection must name it.
+      - name: A different theorem is rejected
+        run: |
+          set -euo pipefail
+          if ./verify.sh --theorem Challenge.other \
+              --challenge "https://github.com/$REPO" --challenge-commit "$CHALLENGE_COMMIT" \
+              --challenge-module "$CHALLENGE_MODULE" --prover "$REPO" --workflow-repo "$REPO" 2>/tmp/err; then
+            echo "accepted a theorem that was not proven" >&2; exit 1
+          fi
+          cat /tmp/err >&2
+          grep -q 'theorem is' /tmp/err
+
+      - name: A different challenge module is rejected
+        run: |
+          set -euo pipefail
+          if ./verify.sh --theorem "$THEOREM" \
+              --challenge "https://github.com/$REPO" --challenge-commit "$CHALLENGE_COMMIT" \
+              --challenge-module Other --prover "$REPO" --workflow-repo "$REPO" 2>/tmp/err; then
+            echo "accepted a module the theorem was not stated in" >&2; exit 1
+          fi
+          cat /tmp/err >&2
+          grep -q 'challenge module is' /tmp/err
+
+      # The solution tree is a subject of the same attestation, so gh finds it;
+      # the predicate binds that digest to the solution role, and verify.sh
+      # must refuse to treat it as the audited challenge.
+      - name: The solution tree offered as the challenge is rejected
+        run: |
+          set -euo pipefail
+          if ./verify.sh --theorem "$THEOREM" \
+              --challenge "https://github.com/$REPO" --challenge-commit "$SOLUTION_COMMIT" \
+              --challenge-module "$SOLUTION_MODULE" --prover "$REPO" --workflow-repo "$REPO" 2>/tmp/err; then
+            echo "accepted the solution tree in the challenge role" >&2; exit 1
+          fi
+          cat /tmp/err >&2
+          grep -q 'challenge commit is' /tmp/err
+
+      - name: A workflow revision the verifier does not trust is rejected
+        run: |
+          set -euo pipefail
+          # HEAD~1 is a revision of this repository that did not sign the
+          # attestation (on the initial commit: an id that is not in the
+          # clone, which is rejected before any lookup).
+          other="$(git rev-parse --verify -q 'HEAD~1^{commit}' 2>/dev/null || printf 'c%.0s' $(seq 40))"
+          if ./verify.sh --theorem "$THEOREM" \
+              --challenge "https://github.com/$REPO" --challenge-commit "$CHALLENGE_COMMIT" \
+              --challenge-module "$CHALLENGE_MODULE" --prover "$REPO" --workflow-repo "$REPO" \
+              --workflow-commit "$other" 2>/tmp/err; then
+            echo "accepted an attestation signed by an untrusted workflow revision" >&2; exit 1
+          fi
+          cat /tmp/err >&2
+          grep -q 'not a trusted revision\|not in this clone' /tmp/err
+
+      - name: An axiom policy the verifier does not accept is rejected
+        run: |
+          set -euo pipefail
+          if ./verify.sh --theorem "$THEOREM" \
+              --challenge "https://github.com/$REPO" --challenge-commit "$CHALLENGE_COMMIT" \
+              --challenge-module "$CHALLENGE_MODULE" --prover "$REPO" --workflow-repo "$REPO" \
+              --allowed-axioms propext 2>/tmp/err; then
+            echo "accepted a proof under axioms the verifier did not allow" >&2; exit 1
+          fi
+          cat /tmp/err >&2
+          grep -q 'not accepted with --allowed-axioms' /tmp/err

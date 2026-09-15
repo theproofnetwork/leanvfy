@@ -1,14 +1,23 @@
 name: Test Helper Scripts
 
-# Two jobs, both on every push and pull request; nothing here touches the
-# toolchain or produces attestations.
-#   lint     runs the same pre-commit hooks a `git commit` runs locally
-#            (.pre-commit-config.yaml): formatting, shellcheck, workflow
-#            linting and security audit (every `uses:` SHA-pinned), lockfile
-#            and requirements pinning, secrets.
-#   scripts  exercises the trusted host-side scripts against the inputs a
-#            hostile prover controls: URL shapes, adversarial repository trees,
-#            Lake manifests, and the tree digest. See scripts/test-fetch.sh.
+# Three jobs, all on every push and pull request; nothing here produces
+# attestations (e2e.yml does, with the real reusable workflow).
+#   lint      runs the same pre-commit hooks a `git commit` runs locally
+#             (.pre-commit-config.yaml): formatting, shellcheck, workflow
+#             linting and security audit (every `uses:` SHA-pinned), lockfile
+#             and requirements pinning, secrets.
+#   scripts   exercises the trusted host-side scripts against the inputs a
+#             hostile prover controls, without Lean: URL shapes, adversarial
+#             repository trees, Lake manifests and the tree digest
+#             (scripts/test-fetch.sh); toolchain.lock, provisioning with
+#             sha256 enforcement and the predicate (scripts/test-toolchain.sh);
+#             verify.sh's claim checks against a shim gh
+#             (scripts/test-verify.sh); and that the comparator patch still
+#             applies to the pinned upstream commit.
+#   pipeline  provisions the real pinned toolchain and runs the evaluate
+#             pipeline end to end on local Lake packages: honest and dishonest
+#             solutions through the build jails, comparator and all three
+#             kernels, plus jail containment (scripts/test-pipeline.sh).
 
 on:
   push:
@@ -48,8 +57,9 @@ jobs:
 
       - name: Install System Dependencies
         run: |
+          set -euo pipefail
           sudo apt-get update && sudo apt-get install -y --no-install-recommends \
-                       bubblewrap jq curl git openssl python3 ca-certificates
+                       bubblewrap jq curl git openssl python3 ca-certificates zstd
           # Same as leanvfy.yml: grant `userns` to bwrap alone via AppArmor.
           bash scripts/allow-bwrap-userns.sh
 
@@ -79,11 +89,26 @@ jobs:
               sys.exit("capabilities usable inside an unprivileged user namespace; restriction is off")
           EOF
 
-      - name: Untrusted-input hardening tests
+      # check-jsonschema for build-predicate.sh, installed exactly as the
+      # attest job installs it (hash-pinned, no dependency resolution).
+      - name: Install check-jsonschema
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install --require-hashes --no-deps --only-binary=:all: -r scripts/requirements.txt
+          echo "/tmp/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Untrusted-input hardening (fetch, manifests, tree digest)
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_SHA: ${{ github.sha }}
         run: bash scripts/test-fetch.sh
+
+      - name: Lockfile, provisioning and predicate
+        run: bash scripts/test-toolchain.sh
+
+      - name: Verifier (verify.sh against a shim gh)
+        run: bash scripts/test-verify.sh
 
       # The comparator patch must keep applying to the pinned upstream commit.
       - name: Comparator patch applies to the pinned commit
@@ -97,19 +122,34 @@ jobs:
             echo "$p applies"
           done
 
-      # A predicate built from placeholder values must validate against the schema.
-      - name: Predicate schema round trip
+  pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      # The same packages and the same AppArmor exception as leanvfy.yml's
+      # evaluate job (openssl and python3 serve the fixtures over https).
+      - name: Install System Dependencies
         run: |
           set -euo pipefail
-          python3 -m venv /tmp/venv
-          /tmp/venv/bin/pip install --require-hashes --no-deps --only-binary=:all: -r scripts/requirements.txt
-          export PATH="/tmp/venv/bin:$PATH"
-          THEOREM="Foo.main" \
-          CHALLENGE_REPO="https://github.com/a/b" CHALLENGE_COMMIT="$(printf 'a%.0s' $(seq 40))" \
-          CHALLENGE_MODULE="Challenge.Statement" CHALLENGE_DIGEST="$(printf '1%.0s' $(seq 64))" \
-          SOLUTION_REPO="https://github.com/c/d" SOLUTION_COMMIT="$(printf 'b%.0s' $(seq 40))" \
-          SOLUTION_MODULE="Solution" SOLUTION_DIGEST="$(printf '2%.0s' $(seq 64))" \
-          ALLOWED_AXIOMS="propext,Quot.sound,Classical.choice" \
-          TOOLCHAIN_LOCK=toolchain.lock SCHEMA_FILE=schemas/leanvfy-v1.json \
-          bash scripts/build-predicate.sh /tmp/predicate.json
-          jq . /tmp/predicate.json
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+                       bubblewrap jq curl coreutils zstd git openssl python3 ca-certificates
+          bash scripts/allow-bwrap-userns.sh
+
+      # The real thing: the Lean release and the verifier binaries of
+      # toolchain.lock, hash-checked, into /opt/lean and /opt/bin.
+      - name: Provision Pinned Toolchain
+        run: bash scripts/provision-toolchain.sh toolchain.lock
+
+      - name: Assert No Lean On Host
+        run: |
+          set -euo pipefail
+          if command -v lean || command -v lake; then
+            echo "Security violation: Lean toolchain reachable on the host." >&2
+            exit 1
+          fi
+
+      - name: Evaluate pipeline end to end (build jails, comparator, kernels)
+        run: bash scripts/test-pipeline.sh

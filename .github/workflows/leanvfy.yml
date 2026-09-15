@@ -180,41 +180,15 @@ jobs:
             exit 1
           fi
 
-      # comparator is configured through this JSON file only. In the mode used
-      # here it receives two ready-made exports and neither builds nor exports
-      # anything itself. It also knows which declarations those exports must
-      # contain (the theorem, the permitted axioms, the kernel's built-in
-      # constants); asking it rather than repeating the list keeps the two in
-      # step. comparator is statically linked and needs no Lean for this.
-      # Kernel names containing "noda" receive nanoda's JSON config instead of
-      # the export path; everything else gets the path as its last argument.
+      # comparator's configuration (the theorem, the axiom whitelist, the
+      # external kernels) and, from comparator itself, the declarations the
+      # exports below must contain; see scripts/write-comparator-config.sh.
       - name: Write Comparator Config & Export Targets
         env:
           THEOREM: ${{ inputs.theorem }}
           CHALLENGE_MODULE: ${{ inputs.challenge_module }}
           SOLUTION_MODULE: ${{ inputs.solution_module }}
-        run: |
-          set -euo pipefail
-          jq -n \
-            --arg challenge "$CHALLENGE_MODULE" \
-            --arg solution "$SOLUTION_MODULE" \
-            --arg theorem "$THEOREM" \
-            --arg axioms "$ALLOWED_AXIOMS" \
-            '{
-              challenge_module: $challenge,
-              solution_module: $solution,
-              challenge_export: "/exports/challenge.export",
-              solution_export: "/exports/solution.export",
-              theorem_names: [$theorem],
-              permitted_axioms: ($axioms | split(",") | map(select(length > 0))),
-              external_kernels: {
-                nanoda: ["nanoda_bin"],
-                eink0rn: ["eink0rn", "--enforce-mutual-univ", "-j"]
-              }
-            }' > /tmp/comparator.json
-          cat /tmp/comparator.json
-          /opt/bin/comparator --print-export-targets /tmp/comparator.json > /tmp/export-targets
-          echo "Export targets: $(tr '\n' ' ' < /tmp/export-targets)"
+        run: bash leanvfy/scripts/write-comparator-config.sh /tmp/comparator.json /tmp/export-targets
 
       # -----------------------------------------------------------------------
       # SANDBOXED BUILDS AND EXPORTS -- the only places prover code runs

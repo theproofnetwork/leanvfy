@@ -5,82 +5,20 @@
 # .github/workflows/test-scripts.yml and usable locally with sudo (it installs a
 # throwaway CA into the system trust store for the duration of the run).
 #
-# Adversarial repositories are served from a local HTTPS server (git's dumb
-# protocol over python's http.server with a self-signed certificate), because
-# every hostile tree has to arrive the way a prover's would: over https, through
-# the jail. Rejections that need no server (URL shapes, manifest contents) are
-# tested directly. When GITHUB_REPOSITORY/GITHUB_SHA are set the smart-HTTP
-# happy path is exercised against that public repository as well.
+# Adversarial repositories are served from the local https server of
+# test-lib.sh, because every hostile tree has to arrive the way a prover's
+# would: over https, through the jail. Rejections that need no server (URL
+# shapes, manifest contents) are tested directly. When
+# GITHUB_REPOSITORY/GITHUB_SHA are set the smart-HTTP happy path is exercised
+# against that public repository as well.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-work="$(mktemp -d)"
-server_pid=""
-cleanup() {
-    [ -n "$server_pid" ] && kill "$server_pid" 2>/dev/null || true
-    if [ -f /usr/local/share/ca-certificates/leanvfy-test.crt ]; then
-        sudo rm -f /usr/local/share/ca-certificates/leanvfy-test.crt
-        sudo update-ca-certificates --fresh >/dev/null
-    fi
-    rm -rf "$work"
-}
-trap cleanup EXIT
-
-pass=0
-fail=0
-ok() {
-    pass=$((pass + 1))
-    echo "  ok   $1"
-}
-bad() {
-    fail=$((fail + 1))
-    echo "  FAIL $1" >&2
-}
-# expect_reject <description> <cmd...>: the command must exit non-zero.
-expect_reject() {
-    local desc="$1"
-    shift
-    if "$@" >"$work/last.log" 2>&1; then
-        bad "$desc (was accepted)"
-        sed 's/^/       /' "$work/last.log" >&2
-    else
-        ok "$desc"
-    fi
-}
-expect_accept() {
-    local desc="$1"
-    shift
-    if "$@" >"$work/last.log" 2>&1; then
-        ok "$desc"
-    else
-        bad "$desc (was rejected)"
-        sed 's/^/       /' "$work/last.log" >&2
-    fi
-}
+# shellcheck source=scripts/test-lib.sh
+source "$here/test-lib.sh"
+test_init
 
 # --- fixtures ---------------------------------------------------------------
-export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
-export GIT_AUTHOR_DATE="2026-01-01T00:00:00Z" GIT_COMMITTER_DATE="2026-01-01T00:00:00Z"
-srv="$work/srv"
-mkdir -p "$srv"
-base="https://127.0.0.1:8443"
-
-# publish <name> <workdir>: commit everything in <workdir>, serve it as
-# <name>.git and print the commit id.
-publish() {
-    local name="$1" dir="$2"
-    [ "${3:-}" = "noadd" ] || git -C "$dir" add -A >/dev/null
-    git -C "$dir" commit -q -m "fixture $name" --allow-empty
-    git clone -q --bare "$dir" "$srv/$name.git"
-    git -C "$srv/$name.git" update-server-info
-    git -C "$dir" rev-parse HEAD
-}
-new_repo() {
-    local d="$work/src/$1"
-    mkdir -p "$d"
-    git -C "$d" init -q
-    echo "$d"
-}
 
 # A dependency package and a good root package whose manifest pins it.
 d="$(new_repo dep)"
@@ -148,44 +86,12 @@ echo alpha >"$d/$(printf 'a\n100644 %s b' "$(sha256sum <"$work/src/two_files/b" 
 forged_name_commit="$(publish forged_name "$d")"
 
 # --- local https server ------------------------------------------------------
-openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=leanvfy-test \
-    -addext "subjectAltName=IP:127.0.0.1" -keyout "$work/key.pem" -out "$work/cert.pem" 2>/dev/null
-sudo cp "$work/cert.pem" /usr/local/share/ca-certificates/leanvfy-test.crt
-sudo update-ca-certificates >/dev/null
-cat >"$work/server.py" <<'EOF'
-import http.server, ssl, sys
-root, cert, key = sys.argv[1:4]
-class H(http.server.SimpleHTTPRequestHandler):
-    def __init__(self, *a, **k): super().__init__(*a, directory=root, **k)
-    def do_GET(self):
-        if self.path.startswith("/redirect-file/"):
-            self.send_response(302); self.send_header("Location", "file:///etc/passwd"); self.end_headers(); return
-        if self.path.startswith("/redirect-http/"):
-            self.send_response(302); self.send_header("Location", "http://127.0.0.1:8080" + self.path); self.end_headers(); return
-        super().do_GET()
-    def log_message(self, *a): pass
-srv = http.server.ThreadingHTTPServer(("127.0.0.1", 8443), H)
-ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(cert, key)
-srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
-srv.serve_forever()
-EOF
-python3 "$work/server.py" "$srv" "$work/cert.pem" "$work/key.pem" &
-server_pid=$!
-for _ in $(seq 50); do
-    curl -sf --cacert "$work/cert.pem" "$base/good.git/HEAD" >/dev/null 2>&1 && break
-    sleep 0.2
-done
-curl -sf --cacert "$work/cert.pem" "$base/good.git/HEAD" >/dev/null || {
-    echo "test server did not come up" >&2
-    exit 1
-}
+https_server
 
 fetch="$here/fetch-repo.sh"
 mat="$here/materialize-deps.sh"
 digest="$here/tree-digest.sh"
 zeros="$(printf '0%.0s' $(seq 40))"
-mkdir -p "$work/out"
-out() { mktemp -u "$work/out/XXXXXXXX"; }
 
 echo "URL shapes"
 rm -f /tmp/leanvfy-pwned
@@ -318,6 +224,4 @@ if [ -n "${GITHUB_REPOSITORY:-}" ] && [ -n "${GITHUB_SHA:-}" ]; then
     grep -q "Fetch by object id refused" "$work/last.log" && bad "GitHub needed the full-fetch fallback" || ok "fetched with --depth 1 by object id"
 fi
 
-echo
-echo "$pass passed, $fail failed"
-[ "$fail" -eq 0 ]
+test_summary

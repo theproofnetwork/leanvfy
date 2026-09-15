@@ -258,7 +258,11 @@ jobs:
       id-token: write
       contents: read
       attestations: write
+      artifact-metadata: write
 ```
+
+(`artifact-metadata: write` is what `actions/attest` needs to record the attestation's storage
+metadata; a caller granting less than the called workflow's jobs request is refused by GitHub.)
 
 Both repositories must be public Lake packages (there are deliberately no credentials). The challenge
 declares the theorem with `sorry` in `challenge_module`, is configured by `lakefile.toml` (no
@@ -329,3 +333,39 @@ What the hooks enforce, and why:
 
 Update hook versions with `pre-commit autoupdate --freeze` (keeps `rev:` a commit id);
 `toolchain.lock` is updated only via `build-tools.yml`.
+
+### Tests
+
+The behavioural tests live in `scripts/test-*.sh`, share [scripts/test-lib.sh](scripts/test-lib.sh)
+(pass/fail tally, git fixtures, and a local https git server with a throwaway CA, because every
+hostile input has to arrive the way a prover's would: over https, through the jail) and print one
+line per check. They run on Linux; the ones that jail need bubblewrap with `--disable-userns`
+(Ubuntu 24.04) and passwordless sudo for the CA.
+
+| Suite | What it exercises | Needs |
+|---|---|---|
+| [test-fetch.sh](scripts/test-fetch.sh) | `fetch-repo.sh`, `materialize-deps.sh`, `tree-digest.sh` and `verify.sh --digest-only` against hostile inputs: every non-https transport and redirect, host git configuration, committed `.lake`/oleans/submodules/`lakefile.lean`, manifest shapes, and the digest's NUL-terminated encoding (a path with a newline cannot forge records). | bwrap, sudo |
+| [test-toolchain.sh](scripts/test-toolchain.sh) | `check-toolchain-lock.py` on malformed lockfiles; `provision-toolchain.sh` against a fake Lean release and tools served locally: sha256 mismatches, http and redirects, install targets, root-owned read-only results, `--lean-only`; `build-predicate.sh`: the predicate mirrors the lockfile and the schema rejects malformed claims. | sudo, check-jsonschema |
+| [test-verify.sh](scripts/test-verify.sh) | `verify.sh` with a shim `gh` on PATH that records how `gh attestation verify` is invoked (subject listing, issuer, signer workflow, self-hosted denial, predicate type) and returns a canned result built around a predicate `build-predicate.sh` produced from `toolchain.lock` at HEAD; every claim (theorem, module, commit, role of the digest, signer revision, runner, toolchain block, axiom policy) is then tampered with in turn and must be named in the rejection. Portable: git, jq, check-jsonschema. | check-jsonschema |
+| [test-pipeline.sh](scripts/test-pipeline.sh) | The evaluate pipeline on the real pinned toolchain: a challenge with a dependency, then solutions that must pass (importing the challenge's definitions through a `require`; restating them) and be rejected (sorry, an extra axiom, a redefined constant, a different statement, a missing theorem, a wrong module), bad exports handed to the comparator jail, and a solution whose module runs shell commands at build time -- it must still pass, and nothing it did may have reached the host, the other workspace, the verifier binaries or the network, nor outlived its jail. | provisioned toolchain, bwrap, sudo |
+
+To run them locally, provision the toolchain once (`sudo` installs into `/opt/lean` and `/opt/bin`)
+and install `check-jsonschema` from the pinned requirements:
+
+```sh
+bash scripts/provision-toolchain.sh toolchain.lock
+python3 -m venv .venv && .venv/bin/pip install --require-hashes --no-deps -r scripts/requirements.txt
+PATH=".venv/bin:$PATH" bash scripts/test-pipeline.sh      # or any other suite
+```
+
+CI runs them in [test-scripts.yml](.github/workflows/test-scripts.yml) (jobs `scripts` and
+`pipeline`, next to `lint`) and, in [e2e.yml](.github/workflows/e2e.yml), calls the reusable
+workflow itself on the fixture packages kept in the orphan branches `fixtures/challenge` and
+`fixtures/solution` of this repository -- a genuine attestation, signed on a GitHub-hosted runner
+-- and then runs `verify.sh` against it as a verifier would, including the rejections only a real
+Sigstore bundle can exercise (another theorem or module, the solution tree offered in the
+challenge role, an untrusted workflow revision, a narrower axiom policy). The solution fixture
+pins the challenge fixture's commit in its `lake-manifest.json`; the workflow inputs resolve the
+branch heads at run time, so changing a fixture means updating its branch (and, for the
+challenge, the solution's manifest). Rejections of dishonest solutions are not part of `e2e.yml`
+-- a failing reusable-workflow job fails the run -- and are covered by `test-pipeline.sh`.
