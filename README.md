@@ -35,6 +35,8 @@ This helps guarding against exploits that are only present in one of the kernels
 Every kernel judges the same exported bytes, and each external kernel runs in its own landrun sandbox.
 Prover code runs only in the two build sandboxes, which are gone before the verdict is computed.
 
+<!-- TODO upstream on lean/comparator: request the option to provide exports directly -->
+
 ## Adversarial model
 
 We model three parties which may coincide: <br>
@@ -307,9 +309,6 @@ the script cannot do is the audit itself: that the challenge module at that comm
 intended statement is the verifier's judgement (see "What a verifier must audit in a challenge").
 The solution is never needed on the verifier's machine.
 
-<!-- TODO Document security considerations and mitigations -->
-<!-- TODO resolve todos in workflow -->
-<!-- TODO upstream on lean/comparator: request the option to provide exports directly -->
 
 ## Development
 
